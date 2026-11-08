@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proxmox &amp; Docker Security Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body class="bg-slate-950 text-slate-200 min-h-screen">
+
+<!-- ================= TOPBAR ================= -->
+<header class="sticky top-0 z-30 border-b border-slate-800 bg-slate-950/90 backdrop-blur">
+  <div class="max-w-7xl mx-auto px-4 py-3 flex items-center gap-3 flex-wrap">
+    <div class="flex items-center gap-2 mr-2">
+      <span class="w-8 h-8 rounded-lg bg-emerald-500/15 border border-emerald-500/40 grid place-items-center text-emerald-400 font-bold">SD</span>
+      <div>
+        <h1 class="font-semibold leading-tight">Proxmox &amp; Docker Security Dashboard</h1>
+        <p class="text-xs text-slate-500 leading-tight" id="env-line">wykrywanie środowiska…</p>
+      </div>
+    </div>
+    <span id="env-pve" class="hidden text-xs px-2 py-0.5 rounded-full border border-violet-500/50 bg-violet-500/10 text-violet-300">Proxmox VE</span>
+    <span id="env-docker" class="hidden text-xs px-2 py-0.5 rounded-full border border-sky-500/50 bg-sky-500/10 text-sky-300">Docker</span>
+    <div class="flex-1"></div>
+    <input id="search" type="text" placeholder="Filtruj zasoby…"
+           class="bg-slate-900 border border-slate-700 rounded-lg px-3 py-1.5 text-sm w-44 focus:outline-none focus:border-emerald-500/60">
+    <button id="btn-scan-all" class="btn btn-primary">Skanuj wszystko</button>
+    <button id="btn-add-ssh" class="btn btn-ghost">+ Host SSH</button>
+    <button id="btn-settings" class="btn btn-ghost">Ustawienia</button>
+  </div>
+</header>
+
+<main class="max-w-7xl mx-auto px-4 py-6 space-y-6">
+
+  <!-- ================= PODSUMOWANIE ================= -->
+  <section class="grid grid-cols-2 md:grid-cols-6 gap-3" id="summary-cards">
+    <div class="card stat"><div class="stat-num" id="s-hosts">0</div><div class="stat-label">Zasoby</div></div>
+    <div class="card stat"><div class="stat-num text-red-400" id="s-crit">0</div><div class="stat-label">CRITICAL</div></div>
+    <div class="card stat"><div class="stat-num text-orange-400" id="s-high">0</div><div class="stat-label">HIGH</div></div>
+    <div class="card stat"><div class="stat-num text-amber-300" id="s-med">0</div><div class="stat-label">MEDIUM</div></div>
+    <div class="card stat"><div class="stat-num text-sky-400" id="s-low">0</div><div class="stat-label">LOW</div></div>
+    <div class="card stat"><div class="stat-num text-emerald-400" id="s-tasks">0</div><div class="stat-label">Zadania w toku</div></div>
+  </section>
+
+  <!-- ================= TABELA ZASOBÓW ================= -->
+  <section class="card">
+    <div class="flex items-center justify-between px-4 py-3 border-b border-slate-800">
+      <h2 class="font-semibold">Zasoby <span class="text-slate-500 text-sm font-normal" id="hosts-count"></span></h2>
+      <button id="btn-refresh" class="btn btn-ghost text-xs">Odśwież</button>
+    </div>
+    <div class="overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead class="text-xs text-slate-400 border-b border-slate-800">
+          <tr>
+            <th class="th">Typ</th><th class="th">Nazwa</th><th class="th">Status</th>
+            <th class="th">Skaner</th><th class="th">Podatności</th>
+            <th class="th">Ostatni skan</th><th class="th text-right pr-4">Akcje</th>
+          </tr>
+        </thead>
+        <tbody id="hosts-body" class="divide-y divide-slate-800/70"></tbody>
+      </table>
+    </div>
+    <p id="hosts-empty" class="hidden text-center text-slate-500 text-sm py-8">
+      Brak zasobów. Panel wykrywa automatycznie Proxmox VE (/etc/pve), Dockera (/var/run/docker.sock)
+      i hosty SSH dodane ręcznie.
+    </p>
+  </section>
+
+  <!-- ================= DZIENNIK ================= -->
+  <section class="card">
+    <div class="flex items-center justify-between px-4 py-3 border-b border-slate-800">
+      <h2 class="font-semibold">Dziennik aktywności</h2>
+      <button id="btn-clear-tasks" class="btn btn-ghost text-xs">Wyczyść zakończone zadania</button>
+    </div>
+    <ul id="logs-list" class="px-4 py-2 text-xs space-y-1 max-h-64 overflow-y-auto font-mono"></ul>
+  </section>
+
+  <footer class="text-center text-xs text-slate-600 py-4">
+    Proxmox &amp; Docker Security Dashboard v<span id="ver">1.0.0</span> ·
+    Trivy (Aqua Security) &amp; Grype (Anchore) · dane: data/state.json
+  </footer>
+</main>
+
+<!-- ================= PANEL ZADAŃ ================= -->
+<div id="tasks-panel" class="hidden fixed bottom-4 right-4 z-40 w-80 max-h-80 overflow-y-auto rounded-xl
+     border border-slate-700 bg-slate-900/95 shadow-2xl backdrop-blur divide-y divide-slate-800"></div>
+
+<!-- ================= MODAL: SZCZEGÓŁY SKANU ================= -->
+<div id="modal-details" class="modal hidden">
+  <div class="modal-box max-w-4xl">
+    <div class="flex items-start justify-between gap-4 border-b border-slate-800 pb-3">
+      <div>
+        <h3 class="font-semibold text-lg" id="det-title">Podatności</h3>
+        <p class="text-xs text-slate-500" id="det-meta"></p>
+      </div>
+      <div class="flex gap-2">
+        <button id="btn-rescan" class="btn btn-ghost text-xs">Skanuj ponownie</button>
+        <button class="btn btn-ghost text-xs" data-close>Zamknij</button>
+      </div>
+    </div>
+    <div id="det-warn" class="hidden mt-3 text-xs rounded-lg border border-amber-500/40 bg-amber-500/10 text-amber-300 px-3 py-2"></div>
+    <div class="flex items-center gap-2 mt-3 flex-wrap" id="det-filters"></div>
+    <div class="overflow-x-auto mt-3 max-h-[55vh] overflow-y-auto">
+      <table class="w-full text-sm">
+        <thead class="text-xs text-slate-400 border-b border-slate-800 sticky top-0 bg-slate-900">
+          <tr><th class="th">Waga</th><th class="th">CVE / ID</th><th class="th">Pakiet</th>
+              <th class="th">Wersja</th><th class="th text-right pr-3">Akcja</th></tr>
+        </thead>
+        <tbody id="det-body" class="divide-y divide-slate-800/70"></tbody>
+      </table>
+    </div>
+    <div class="mt-4 flex items-center justify-between gap-3 flex-wrap">
+      <p class="text-xs text-slate-500">Aktualizacja wykonuje odpowiednik
+        <code class="text-emerald-400">apt-get install --only-upgrade</code> /
+        <code class="text-emerald-400">apk add --upgrade</code> na wybranym celu.</p>
+      <button id="btn-fix-all" class="btn btn-primary">Zaktualizuj wszystkie podatne pakiety naraz</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= MODAL: USTAWIENIA ================= -->
+<div id="modal-settings" class="modal hidden">
+  <div class="modal-box max-w-3xl">
+    <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+      <h3 class="font-semibold text-lg">Ustawienia</h3>
+      <button class="btn btn-ghost text-xs" data-close>Zamknij</button>
+    </div>
+
+    <div class="mt-4 space-y-5 max-h-[60vh] overflow-y-auto pr-1">
+      <!-- skanowanie -->
+      <fieldset class="settings-block">
+        <legend>Skanowanie</legend>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <label class="field"><span>Silnik skanowania</span>
+            <select id="set-engine" class="input">
+              <option value="trivy">Trivy</option>
+              <option value="grype">Grype</option>
+              <option value="both">Trivy + Grype (suma)</option>
+            </select></label>
+          <label class="field"><span>Powiadamiaj od poziomu</span>
+            <select id="set-minsev" class="input">
+              <option value="CRITICAL">tylko CRITICAL</option>
+              <option value="HIGH">HIGH i CRITICAL</option>
+            </select></label>
+          <label class="field"><span>Harmonogram skanów (godziny, 0 = wyłączony)</span>
+            <input id="set-interval" type="number" min="0" max="168" step="1" class="input"></label>
+          <div class="field space-y-2 justify-self-start">
+            <label class="chk"><input id="set-upddb" type="checkbox"> Aktualizuj bazę CVE przed skanem</label>
+            <label class="chk"><input id="set-autoinst" type="checkbox"> Automatycznie doinstaluj skaner przy skanie</label>
+            <label class="chk"><input id="set-allimg" type="checkbox"> Skanuj także obrazy Docker bez kontenerów</label>
+          </div>
+        </div>
+      </fieldset>
+
+      <!-- Proxmox API -->
+      <fieldset class="settings-block">
+        <legend>Proxmox API (zdalne węzły)</legend>
+        <label class="chk"><input id="set-pve-on" type="checkbox"> Włącz integrację Proxmox API</label>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+          <label class="field"><span>URL (np. https://pve.local:8006)</span>
+            <input id="set-pve-url" class="input" placeholder="https://192.168.1.10:8006"></label>
+          <label class="field"><span>API Token (user@realm!tokenid=uuid)</span>
+            <input id="set-pve-token" class="input" placeholder="root@pam!dashboard=xxxx"></label>
+          <label class="field"><span>Użytkownik (gdy bez tokena)</span>
+            <input id="set-pve-user" class="input" placeholder="root@pam"></label>
+          <label class="field"><span>Hasło (gdy bez tokena)</span>
+            <input id="set-pve-pass" type="password" class="input"></label>
+        </div>
+        <label class="chk mt-2"><input id="set-pve-ssl" type="checkbox"> Weryfikuj certyfikat SSL</label>
+      </fieldset>
+
+      <!-- ntfy -->
+      <fieldset class="settings-block">
+        <legend>ntfy (push)</legend>
+        <label class="chk"><input id="set-ntfy-on" type="checkbox"> Włącz</label>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+          <label class="field"><span>URL tematu</span>
+            <input id="set-ntfy-url" class="input" placeholder="https://ntfy.sh/twoj-temat"></label>
+          <label class="field"><span>Token (opcjonalny, self-hosted)</span>
+            <input id="set-ntfy-token" class="input" type="password"></label>
+        </div>
+      </fieldset>
+
+      <!-- Gotify -->
+      <fieldset class="settings-block">
+        <legend>Gotify</legend>
+        <label class="chk"><input id="set-gotify-on" type="checkbox"> Włącz</label>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+          <label class="field"><span>URL serwera</span>
+            <input id="set-gotify-url" class="input" placeholder="https://gotify.local"></label>
+          <label class="field"><span>Token aplikacji</span>
+            <input id="set-gotify-token" class="input" type="password"></label>
+        </div>
+      </fieldset>
+
+      <!-- Home Assistant -->
+      <fieldset class="settings-block">
+        <legend>Home Assistant</legend>
+        <label class="chk"><input id="set-ha-on" type="checkbox"> Włącz</label>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+          <label class="field"><span>URL (np. http://ha.local:8123)</span>
+            <input id="set-ha-url" class="input" placeholder="http://192.168.1.20:8123"></label>
+          <label class="field"><span>Token długoterminowy</span>
+            <input id="set-ha-token" class="input" type="password"></label>
+          <label class="field"><span>Encja sensora stanu</span>
+            <input id="set-ha-sensor" class="input" placeholder="sensor.security_dashboard"></label>
+          <label class="field"><span>Usługa notify (opcjonalna)</span>
+            <input id="set-ha-notify" class="input" placeholder="notify.mobile_app_telefon"></label>
+        </div>
+      </fieldset>
+
+      <!-- Discord -->
+      <fieldset class="settings-block">
+        <legend>Discord</legend>
+        <label class="chk"><input id="set-discord-on" type="checkbox"> Włącz</label>
+        <label class="field mt-2"><span>Webhook URL</span>
+          <input id="set-discord-url" class="input" placeholder="https://discord.com/api/webhooks/…"></label>
+      </fieldset>
+
+      <!-- Telegram -->
+      <fieldset class="settings-block">
+        <legend>Telegram</legend>
+        <label class="chk"><input id="set-tg-on" type="checkbox"> Włącz</label>
+        <div class="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
+          <label class="field"><span>Bot token (od @BotFather)</span>
+            <input id="set-tg-token" class="input" type="password"></label>
+          <label class="field"><span>Chat ID</span>
+            <input id="set-tg-chat" class="input" placeholder="123456789"></label>
+        </div>
+      </fieldset>
+    </div>
+
+    <div class="mt-4 flex items-center justify-between gap-3 flex-wrap">
+      <button id="btn-test-notify" class="btn btn-ghost">Testuj powiadomienia</button>
+      <button id="btn-save-settings" class="btn btn-primary">Zapisz ustawienia</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= MODAL: DODAJ HOSTA SSH ================= -->
+<div id="modal-ssh" class="modal hidden">
+  <div class="modal-box max-w-xl">
+    <div class="flex items-center justify-between border-b border-slate-800 pb-3">
+      <h3 class="font-semibold text-lg">Dodaj zdalny host (SSH)</h3>
+      <button class="btn btn-ghost text-xs" data-close>Zamknij</button>
+    </div>
+    <div class="mt-4 space-y-3">
+      <div class="grid grid-cols-2 gap-3">
+        <label class="field"><span>Nazwa (opcjonalna)</span>
+          <input id="ssh-name" class="input" placeholder="mój serwer"></label>
+        <label class="field"><span>Adres IP / hostname</span>
+          <input id="ssh-host" class="input" placeholder="192.168.1.50"></label>
+        <label class="field"><span>Port</span>
+          <input id="ssh-port" type="number" value="22" class="input"></label>
+        <label class="field"><span>Użytkownik</span>
+          <input id="ssh-user" class="input" value="root"></label>
+      </div>
+      <label class="field"><span>Uwierzytelnianie</span>
+        <select id="ssh-auth" class="input">
+          <option value="password">Hasło</option>
+          <option value="key">Klucz prywatny (PEM)</option>
+        </select></label>
+      <label class="field" id="ssh-pass-wrap"><span>Hasło</span>
+        <input id="ssh-pass" type="password" class="input"></label>
+      <label class="field hidden" id="ssh-key-wrap"><span>Klucz prywatny</span>
+        <textarea id="ssh-key" rows="5" class="input font-mono text-xs" placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;…&#10;-----END OPENSSH PRIVATE KEY-----"></textarea></label>
+      <label class="field hidden" id="ssh-keypass-wrap"><span>Hasło do klucza (opcjonalne)</span>
+        <input id="ssh-keypass" type="password" class="input"></label>
+      <label class="chk"><input id="ssh-pve" type="checkbox"> To jest węzeł Proxmox VE – wykryj jego LXC i VM (pct/qm)</label>
+      <label class="chk"><input id="ssh-test" type="checkbox" checked> Testuj połączenie przed zapisem</label>
+    </div>
+    <div class="mt-4 flex justify-end gap-2">
+      <button id="btn-ssh-save" class="btn btn-primary">Dodaj hosta</button>
+    </div>
+  </div>
+</div>
+
+<!-- ================= TOASTY ================= -->
+<div id="toasts" class="fixed top-16 right-4 z-50 space-y-2 w-80"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
