@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import subprocess
 
@@ -186,18 +187,51 @@ def lxc_rootfs_path(endpoint: dict) -> str | None:
 
     Umożliwia skanowanie kontenera ZEWNĄTRZ (trivy rootfs) bez instalowania
     czegokolwiek w kontenerze – zgodnie ze specyfikacją.
+
+    Rootfs nie zawsze leży w /var/lib/lxc/<vmid>/rootfs: przy storage ZFS/BTRFS
+    to dataset zamontowany np. w /rpool/data/subvol-<vmid>-disk-0. Prawdziwą
+    ścieżkę czytamy więc z `lxc.rootfs.path` w /var/lib/lxc/<vmid>/config,
+    a kandydatów weryfikujemy markerami systemu plików.
     """
     if endpoint.get("kind") != "pct":
         return None
     vmid = endpoint["vmid"]
-    path = f"/var/lib/lxc/{vmid}/rootfs"
-    try:
-        if endpoint.get("via") == "ssh":
-            rc, _, _ = ssh_manager.run(_ssh_host(endpoint),
-                                       f"test -f {path}/etc/os-release && test -s {path}/etc/os-release", 15)
-        else:
-            rc, _, _ = run_local(["sh", "-c",
-                                  f"test -f {path}/etc/os-release && test -s {path}/etc/os-release"], 15)
-        return path if rc == 0 else None
-    except CommandError:
-        return None
+    via_ssh = endpoint.get("via") == "ssh"
+
+    def _sh(expr: str, timeout: int) -> tuple[int, str, str]:
+        try:
+            if via_ssh:
+                return ssh_manager.run(_ssh_host(endpoint), expr, timeout)
+            return run_local(["sh", "-c", expr], timeout)
+        except CommandError:
+            return 1, "", ""
+
+    # 1) kandydaci z konfiguracji LXC (lxc.rootfs.path = /sciezka | dir:/sciezka | zfs:...)
+    candidates: list[str] = []
+    cfg_rc, cfg_out, _ = _sh(f"cat /var/lib/lxc/{vmid}/config 2>/dev/null", 15)
+    if cfg_rc == 0:
+        for line in (cfg_out or "").splitlines():
+            m = re.match(r"\s*lxc\.rootfs\.(?:path|mount)\s*[:=]\s*(.+?)\s*$", line)
+            if not m:
+                continue
+            p = m.group(1).strip()
+            for pref in ("dir:", "btrfs:"):
+                if p.startswith(pref):
+                    p = p[len(pref):]
+            if p.startswith("zfs:"):
+                p = "/" + p[len("zfs:"):]
+            if p.startswith(("overlayfs:", "loop:", "rbd:", "nbd:")) or "://" in p:
+                continue  # nakładki / urządzenia blokowe – brak katalogu do skanowania
+            if p.startswith("/"):
+                candidates.append(p)
+    # 2) domyślna lokalizacja (storage katalogowy "local")
+    candidates.append(f"/var/lib/lxc/{vmid}/rootfs")
+
+    marker = ("test -d {p} && {{ test -f {p}/bin/sh || test -f {p}/etc/os-release "
+              "|| test -d {p}/usr; }}")
+    for p in dict.fromkeys(candidates):
+        q = shlex.quote(p)
+        rc, _, _ = _sh(marker.format(p=q), 15)
+        if rc == 0:
+            return p
+    return None

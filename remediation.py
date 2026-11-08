@@ -6,6 +6,14 @@ polecenia aktualizacji:
   - Alpine:        apk add --upgrade <paczki>
   - RHEL/CentOS:   dnf update -y <paczki> (fallback: yum)
 
+Odporność na typowe porażki:
+  - `apt-get update` może kończyć się błędem (np. repozytorium enterprise PVE
+    bez subskrypcji) – nie przerywamy wtedy całej naprawy, bo instalacja
+    działa na istniejących indeksach;
+  - pakiety nieobecne w dpkg (np. wykryte w obrazach/JS) są odfiltrowywane,
+    bo `apt-get install --only-upgrade` odrzuciłby cały zestaw;
+  - gdy panel nie ma uprawnień root, podejmowana jest próba przez `sudo -n`.
+
 Działa na wszystkich typach celów obsługiwanych przez executor
 (lokalny, SSH, LXC przez pct exec, VM przez QEMU Guest Agent, docker exec).
 """
@@ -47,10 +55,12 @@ def build_upgrade_cmd(pm: str, packages: list[str], with_update: bool = True) ->
         raise ValueError("Pusta lista pakietów")
     if pm == "apt":
         prefix = "export DEBIAN_FRONTEND=noninteractive; "
-        upd = "apt-get update -qq && " if with_update else ""
+        # `|| true`: nieudany update (np. repo enterprise PVE bez subskrypcji,
+        # zniknięty mirror) nie może blokować instalacji z istniejących indeksów
+        upd = "apt-get update -qq || true; " if with_update else ""
         return f"{prefix}{upd}apt-get install -y --only-upgrade {pkgs}"
     if pm == "apk":
-        upd = "apk update -q && " if with_update else ""
+        upd = "apk update -q || true; " if with_update else ""
         return f"{upd}apk add --upgrade {pkgs}"
     if pm == "dnf":
         return f"(command -v dnf >/dev/null 2>&1 && dnf -y update {pkgs}) || yum -y update {pkgs}"
@@ -70,19 +80,45 @@ def fixable_packages(vulns: list[dict]) -> list[str]:
     return sorted(out)
 
 
+def _dpkg_installed(endpoint: dict) -> set[str] | None:
+    """Zbiór pakietów zainstalowanych w dpkg (None, gdy nie udało się odczytać)."""
+    try:
+        rc, out, _ = executor.execute(
+            endpoint, "dpkg-query -W -f='${binary:Package}\\n' 2>/dev/null || true", 60)
+        if rc != 0:
+            return None
+        return {ln.strip().split(":")[0] for ln in (out or "").splitlines() if ln.strip()}
+    except Exception:
+        return None
+
+
 def upgrade_packages(target: dict, packages: list[str]) -> dict:
-    """Aktualizuje pakiety na celu. Zwraca raport {ok, failed, pm, out}.
+    """Aktualizuje pakiety na celu. Zwraca raport {ok, failed, pm, out, skipped}.
 
     Jeżeli bezpośrednie wykonanie się nie powiedzie (brak uprawnień root),
-    podejmowana jest jedna próba przez `sudo -n`."""
+    podejmowana jest jedna próba przez `sudo -n`. Pakiety nieobecne w dpkg
+    (apt) są pomijane z jawnym powodem, a nie wysypują całego zestawu.
+    """
     if not packages:
-        return {"ok": [], "failed": [], "pm": "", "out": "Brak pakietów do aktualizacji"}
+        return {"ok": [], "failed": [], "skipped": [], "pm": "",
+                "out": "Brak pakietów do aktualizacji"}
     endpoint = target["endpoint"]
     pm = detect_pm(endpoint)
     ok: list[str] = []
     failed: list[dict] = []
+    skipped: list[dict] = []
     outs: list[str] = []
+    installed = _dpkg_installed(endpoint) if pm == "apt" else None
     for chunk in [packages[i:i + 40] for i in range(0, len(packages), 40)]:
+        if installed is not None:
+            missing = [p for p in chunk if p not in installed]
+            chunk = [p for p in chunk if p in installed]
+            skipped.extend([{"pkg": p,
+                             "error": "pakiet nie jest zainstalowany w dpkg (np. "
+                                      "wykryty w obrazie/aplikacji) – pomiń lub "
+                                      "zaktualizuj u źródła"} for p in missing])
+        if not chunk:
+            continue
         cmd = build_upgrade_cmd(pm, chunk)
         rc, out, err = executor.execute(endpoint, cmd, timeout=1800)
         outs.append((out or "")[-1500:])
@@ -97,4 +133,5 @@ def upgrade_packages(target: dict, packages: list[str]) -> dict:
             failed.extend([{"pkg": p, "error": reason or f"Kod wyjścia {rc}"} for p in chunk])
         else:
             ok.extend(chunk)
-    return {"ok": ok, "failed": failed, "pm": pm, "out": "\n---\n".join(outs)[-3000:]}
+    return {"ok": ok, "failed": failed, "skipped": skipped, "pm": pm,
+            "out": "\n---\n".join(outs)[-3000:]}

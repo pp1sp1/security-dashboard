@@ -36,7 +36,7 @@ import ssh_manager         # noqa: E402
 import store               # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 TASKS: dict[str, dict] = {}
 _tasks_lock = threading.RLock()
@@ -440,8 +440,17 @@ def _task_remediate(target_id: str, packages: list[str], progress=None) -> dict:
         raise RuntimeError("Cel nie istnieje")
     progress(f"Aktualizuję {len(packages)} pakietów (wykrywanie menedżera)…")
     result = remediation.upgrade_packages(target, packages)
+    first_err = (result.get("failed") or [{}])[0].get("error", "") if result.get("failed") else ""
+    first_skip = ((result.get("skipped") or [{}])[0].get("pkg", "")
+                  if result.get("skipped") else "")
     store.log(f"Remediacja {target_id}: OK={len(result['ok'])}, "
-              f"błędy={len(result['failed'])} ({result.get('pm', '?')})")
+              f"błędy={len(result.get('failed') or [])}, "
+              f"pominięte={len(result.get('skipped') or [])} ({result.get('pm', '?')})"
+              + (f" – pierwszy błąd: {first_err[:180]}" if first_err else "")
+              + (f"; pominięto m.in. {first_skip}" if first_skip else ""),
+              "error" if result.get("failed") else "info")
+    if first_err:
+        progress(f"Uwaga: część pakietów się nie zaktualizowała ({first_err[:200]})")
     progress("Gotowe – uruchom ponowny skan, aby zweryfikować.")
     return result
 

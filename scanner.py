@@ -38,8 +38,13 @@ INSTALL_TIMEOUT = 420
 
 TRIVY_SKIP_DIRS = ("--skip-dirs /proc --skip-dirs /sys --skip-dirs /dev --skip-dirs /run "
                    "--skip-dirs /var/lib/docker --skip-dirs /var/lib/containerd")
-GRYPE_EXCLUDES = ("--exclude /proc --exclude /sys --exclude /dev --exclude /run "
-                  "--exclude /var/lib/docker --exclude /var/lib/containerd")
+# Uwaga: syft/grype wymaga wzorców GLOB kończących się na '**' – same '/proc'
+# są odrzucane błędem "invalid exclusion pattern(s)". Cudzysłowy chronią '**'
+# przed rozwinięciem przez powłokę.
+GRYPE_EXCLUDES = ("--exclude '/proc/**' --exclude '/sys/**' --exclude '/dev/**' "
+                  "--exclude '/run/**' --exclude '/var/lib/docker/**' "
+                  "--exclude '/var/lib/containerd/**'")
+SCANNER_DIRS = ("/usr/local/bin", "/usr/bin")
 
 _SEV_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "UNKNOWN": 4}
 
@@ -74,9 +79,35 @@ def _version_from_output(out: str) -> str | None:
     return m.group(1) if m else None
 
 
-def check_scanner(endpoint: dict, name: str) -> str | None:
+def scanner_bin(endpoint: dict, name: str) -> str | None:
+    """Bezwzględna ścieżka skanera na celu albo None.
+
+    Działa też tam, gdzie PATH w sesji poleceń jest okrojony (QEMU Guest Agent,
+    systemd) – sprawdza standardowe lokalizacje oprócz `command -v`.
+    """
+    probe = (f"command -v {name} 2>/dev/null"
+             f" || {{ test -x /usr/local/bin/{name} && echo /usr/local/bin/{name}; }}"
+             f" || {{ test -x /usr/bin/{name} && echo /usr/bin/{name}; }}")
     try:
-        rc, out, _ = executor.execute(endpoint, f"{name} --version", timeout=30)
+        rc, out, _ = executor.execute(endpoint, probe, timeout=20)
+    except CommandError:
+        return None
+    if rc != 0:
+        return None
+    lines = [ln.strip() for ln in (out or "").splitlines() if ln.strip()]
+    if not lines:
+        return None
+    bin_path = lines[-1]
+    return bin_path if "/" in bin_path else None
+
+
+def check_scanner(endpoint: dict, name: str) -> str | None:
+    bin_path = scanner_bin(endpoint, name)
+    if not bin_path:
+        return None
+    try:
+        rc, out, _ = executor.execute(endpoint, f"{shlex.quote(bin_path)} --version",
+                                      timeout=30)
     except CommandError:
         return None
     if rc != 0:
@@ -165,6 +196,9 @@ def _deploy_pct(ep: dict, local_path: str, name: str) -> None:
         executor.run_local(["sh", "-c", f"rm -f {shlex.quote(node_tmp)}"], 15)
     if rc != 0:
         raise CommandError(rc, out, err, "pct push nie powiódł się")
+    # Niektóre wersje PVE ignorują --perms – wymuś prawa wykonywania i sprawdź obecność.
+    executor.execute_checked(ep, f"chmod 0755 /usr/local/bin/{name} && "
+                                 f"test -x /usr/local/bin/{name}", 30)
 
 
 def install_scanner(target: dict, name: str, progress=None) -> str:
@@ -196,6 +230,9 @@ def install_scanner(target: dict, name: str, progress=None) -> str:
     try:
         if kind == "local":
             _deploy_local(tmp.name, name)
+        elif kind == "api-lxc":
+            raise CommandError(1, "", "Instalacja w LXC przez samo API PVE nie jest możliwa – "
+                                      "dodaj węzeł przez SSH (zakładka: Dodaj hosta SSH).")
         elif kind == "ssh":
             import ssh_manager
             remote_tmp = f"/tmp/.dash-{name}-{os.getpid()}"
@@ -227,7 +264,7 @@ def install_scanner(target: dict, name: str, progress=None) -> str:
             raise CommandError(1, "", f"Instalacja skanera nieobsługiwana dla endpointu {kind}")
         ver = check_scanner(ep, name)
         if not ver:
-            raise RuntimeError(f"{name} wgrany, ale `--version` nie odpowiada")
+            raise RuntimeError(_install_verify_diag(ep, name))
         say(f"Zainstalowano {name} v{ver}")
         return ver
     finally:
@@ -235,6 +272,32 @@ def install_scanner(target: dict, name: str, progress=None) -> str:
             os.unlink(tmp.name)
         except OSError:
             pass
+
+
+def _install_verify_diag(endpoint: dict, name: str) -> str:
+    """Diagnostyka, gdy binarka została wgrana, ale nie da się jej uruchomić.
+
+    Pokazuje ls -l oraz prawdziwy błąd wykonania (brak pliku / uprawnień /
+    brak ładowarki ELF np. musl / zła architektura), zamiast tajemniczego
+    „--version nie odpowiada”.
+    """
+    parts: list[str] = []
+    for d in SCANNER_DIRS:
+        try:
+            rc, out, err = executor.execute(
+                endpoint,
+                f"ls -l {d}/{name} 2>&1; {d}/{name} --version 2>&1 | head -n 3", 30)
+        except CommandError as exc:
+            out, err = str(exc), ""
+            rc = 1
+        txt = ((out or "") + (err or "")).strip()
+        if txt:
+            parts.append(f"[{d}] {txt[:220]}")
+    diag = " | ".join(parts)[:600]
+    hint = (" (kontener Alpine/musl? użyj skanowania rootfs z węzła albo "
+            "`apk add trivy`)" if "not found" in diag else "")
+    return (f"{name} wgrany, ale `--version` nie odpowiada{hint}. "
+            f"Diagnostyka: {diag or 'brak wyjścia'}")
 
 
 # ---------------------------------------------------------------- bazy CVE
@@ -246,7 +309,12 @@ def update_databases(target: dict, engines: list[str]) -> dict:
     for name in engines:
         if name not in ("trivy", "grype"):
             continue
-        cmd = "trivy image --download-db-only" if name == "trivy" else "grype db update"
+        bin_path = scanner_bin(ep, name)
+        if not bin_path:
+            out[name] = {"ok": False, "msg": "skaner nie jest zainstalowany na celu"}
+            continue
+        cmd = (f"{shlex.quote(bin_path)} image --download-db-only" if name == "trivy"
+               else f"{shlex.quote(bin_path)} db update")
         rc, stdout, err = executor.execute(ep, cmd, 900)
         msg = (stdout or err or "").strip()[-200:] or ("OK" if rc == 0 else f"Kod wyjścia {rc}")
         out[name] = {"ok": rc == 0, "msg": msg}
@@ -319,6 +387,12 @@ def _run_capture(endpoint: dict, cmd: str, timeout: int) -> tuple[int, str, str]
 
 def _scan_trivy(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
                 say) -> tuple[list[dict], bool]:
+    bin_path = scanner_bin(ep, "trivy")
+    if not bin_path:
+        raise CommandError(
+            127, "", "", "Brak trivy na celu skanowania (jeśli LXC – skanowanie z zewnątrz "
+                         "wymaga trivy na węźle PVE; w VM – kliknij „Zainstaluj skaner”)")
+    B = shlex.quote(bin_path)
     skip = "--skip-db-update" if skip_db else ""
     t = target.get("type")
     timeout = SCAN_TIMEOUT + 120
@@ -328,7 +402,7 @@ def _scan_trivy(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
         if not ref:
             raise RuntimeError("Brak referencji obrazu Dockera")
         say(f"trivy image {ref}")
-        cmd = (f"trivy image {skip} --format json --scanners vuln --quiet "
+        cmd = (f"{B} image {skip} --format json --scanners vuln --quiet "
                f"--timeout {SCAN_TIMEOUT}s {shlex.quote(ref)}")
         rc, out, err = _run_capture(ep, cmd, timeout)
         if rc != 0:
@@ -337,7 +411,7 @@ def _scan_trivy(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
 
     if rootfs:
         say(f"trivy rootfs (z zewnątrz, rootfs węzła): {rootfs}")
-        cmd = (f"trivy rootfs {skip} --format json --scanners vuln --quiet "
+        cmd = (f"{B} rootfs {skip} --format json --scanners vuln --quiet "
                f"{TRIVY_SKIP_DIRS} --timeout {SCAN_TIMEOUT}s {shlex.quote(rootfs)}")
         rc, out, err = _run_capture(ep, cmd, timeout)
         if rc != 0:
@@ -347,7 +421,7 @@ def _scan_trivy(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
     if t in ("qemu", "ssh-qemu", "api-qemu"):
         # Skan wewnątrz VM: JSON do pliku, odczyt przez agenta + detekcja ucięcia.
         say("trivy rootfs / (wewnątrz VM, przez QEMU Guest Agent)…")
-        remote = (f"trivy rootfs {skip} --format json --scanners vuln --quiet "
+        remote = (f"{B} rootfs {skip} --format json --scanners vuln --quiet "
                   f"{TRIVY_SKIP_DIRS} --timeout {SCAN_TIMEOUT}s / "
                   f"> /tmp/.dash-scan.json 2>/tmp/.dash-scan.err; echo RC=$?; "
                   f"wc -c < /tmp/.dash-scan.json")
@@ -363,7 +437,10 @@ def _scan_trivy(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
         if scan_rc != 0:
             _, errtxt, _ = _run_capture(ep, "cat /tmp/.dash-scan.err 2>/dev/null; "
                                             "rm -f /tmp/.dash-scan.err /tmp/.dash-scan.json", 30)
-            raise CommandError(scan_rc, out, errtxt, f"trivy w VM zwrócił błąd: {errtxt[:300]}")
+            raise CommandError(
+                scan_rc, out, errtxt,
+                f"trivy w VM zwrócił błąd (rc={scan_rc}): {(errtxt or '').strip()[:250] or 'brak stderr'}"
+                f" | agent: {(err or '').strip()[:200] or '—'}")
         rc2, payload, _ = _run_capture(ep, "cat /tmp/.dash-scan.json; "
                                            "rm -f /tmp/.dash-scan.json /tmp/.dash-scan.err", 180)
         truncated = size > 0 and len(payload or "") < size * 0.97
@@ -371,7 +448,7 @@ def _scan_trivy(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
 
     # local / ssh / pct-inside
     say("trivy rootfs / …")
-    cmd = (f"trivy rootfs {skip} --format json --scanners vuln --quiet "
+    cmd = (f"{B} rootfs {skip} --format json --scanners vuln --quiet "
            f"{TRIVY_SKIP_DIRS} --timeout {SCAN_TIMEOUT}s /")
     rc, out, err = _run_capture(ep, cmd, timeout)
     if rc != 0:
@@ -381,6 +458,12 @@ def _scan_trivy(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
 
 def _scan_grype(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
                 say) -> tuple[list[dict], bool]:
+    bin_path = scanner_bin(ep, "grype")
+    if not bin_path:
+        raise CommandError(
+            127, "", "", "Brak grype na celu skanowania (jeśli LXC – skanowanie z zewnątrz "
+                         "wymaga grype na węźle PVE; w VM – kliknij „Zainstaluj skaner”)")
+    G = shlex.quote(bin_path)
     env_prefix = "GRYPE_DB_AUTO_UPDATE=false " if skip_db else ""
     t = target.get("type")
     timeout = SCAN_TIMEOUT + 120
@@ -388,14 +471,14 @@ def _scan_grype(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
     if t in ("docker-container", "docker-image"):
         ref = (target.get("endpoint") or {}).get("image") or ""
         say(f"grype {ref}")
-        rc, out, err = _run_capture(ep, f"{env_prefix}grype -o json {shlex.quote(ref)}", timeout)
+        rc, out, err = _run_capture(ep, f"{env_prefix}{G} -o json {shlex.quote(ref)}", timeout)
         if rc != 0:
             raise CommandError(rc, out, err, f"grype nie powiódł się: {(err or out)[:300]}")
         return _parse_grype(out), False
 
     if rootfs:
         say(f"grype dir:{rootfs} (z zewnątrz)")
-        rc, out, err = _run_capture(ep, f"{env_prefix}grype -o json "
+        rc, out, err = _run_capture(ep, f"{env_prefix}{G} -o json {GRYPE_EXCLUDES} "
                                         f"{shlex.quote('dir:' + rootfs)}", timeout)
         if rc != 0:
             raise CommandError(rc, out, err, f"grype nie powiódł się: {(err or out)[:300]}")
@@ -403,7 +486,7 @@ def _scan_grype(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
 
     if t in ("qemu", "ssh-qemu", "api-qemu"):
         say("grype dir:/ (wewnątrz VM, przez QEMU Guest Agent)…")
-        remote = (f"{env_prefix}grype -o json {GRYPE_EXCLUDES} dir:/ "
+        remote = (f"{env_prefix}{G} -o json {GRYPE_EXCLUDES} dir:/ "
                   f"> /tmp/.dash-scan.json 2>/tmp/.dash-scan.err; echo RC=$?; "
                   f"wc -c < /tmp/.dash-scan.json")
         rc, out, err = _run_capture(ep, remote, timeout)
@@ -417,14 +500,17 @@ def _scan_grype(target: dict, ep: dict, rootfs: str | None, skip_db: bool,
         if scan_rc != 0:
             _, errtxt, _ = _run_capture(ep, "cat /tmp/.dash-scan.err 2>/dev/null; "
                                             "rm -f /tmp/.dash-scan.err /tmp/.dash-scan.json", 30)
-            raise CommandError(scan_rc, out, errtxt, f"grype w VM zwrócił błąd: {errtxt[:300]}")
+            raise CommandError(
+                scan_rc, out, errtxt,
+                f"grype w VM zwrócił błąd (rc={scan_rc}): {(errtxt or '').strip()[:250] or 'brak stderr'}"
+                f" | agent: {(err or '').strip()[:200] or '—'}")
         rc2, payload, _ = _run_capture(ep, "cat /tmp/.dash-scan.json; "
                                            "rm -f /tmp/.dash-scan.json /tmp/.dash-scan.err", 180)
         truncated = size > 0 and len(payload or "") < size * 0.97
         return _parse_grype(payload), truncated
 
     say("grype dir:/ …")
-    rc, out, err = _run_capture(ep, f"{env_prefix}grype -o json {GRYPE_EXCLUDES} dir:/", timeout)
+    rc, out, err = _run_capture(ep, f"{env_prefix}{G} -o json {GRYPE_EXCLUDES} dir:/", timeout)
     if rc != 0:
         raise CommandError(rc, out, err, f"grype nie powiódł się: {(err or out)[:300]}")
     return _parse_grype(out), False
