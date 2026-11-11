@@ -2,8 +2,10 @@
 
 Funkcje:
   - wykrywanie zainstalowanych skanerów na celu,
-  - automatyczna instalacja (pobranie statycznej binarki z GitHub Releases
-    i wgranie: lokalnie / SFTP / pct push / skrypt w VM / docker cp),
+  - automatyczna instalacja: cel POBIERA binarkę SAM przez curl/wget
+    (GitHub Releases) – przez pct exec / qm guest exec / ssh / docker exec;
+    gdy cel nie ma internetu ani curl/wget – fallback: pobranie na hoście
+    panelu i wgranie (lokalnie / SFTP / pct push / docker cp),
   - aktualizacja baz CVE (trivy image --download-db-only, grype db update),
   - skanowanie: filesystem/rootfs, obrazy Docker; dla LXC domyślnie ZEWNĄTRZ
     (rootfs węzła PVE), z fallbackiem na pct exec; dla VM przez QEMU Guest
@@ -20,6 +22,7 @@ import shutil
 import tarfile
 import tempfile
 import time
+import uuid
 
 import httpx
 
@@ -29,12 +32,9 @@ import store
 from executor import CommandError
 
 GITHUB_API = "https://api.github.com"
-INSTALL_SCRIPTS = {
-    "trivy": "https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh",
-    "grype": "https://raw.githubusercontent.com/anchore/grype/main/install.sh",
-}
 SCAN_TIMEOUT = 1200
-INSTALL_TIMEOUT = 420
+# Pobieranie ~170 MB na celu (często wolne łącze VM/kontenera) – 15 min zapasu.
+INSTALL_TIMEOUT = 900
 
 TRIVY_SKIP_DIRS = ("--skip-dirs /proc --skip-dirs /sys --skip-dirs /dev --skip-dirs /run "
                    "--skip-dirs /var/lib/docker --skip-dirs /var/lib/containerd")
@@ -122,41 +122,83 @@ def check_scanners(endpoint: dict) -> dict:
 
 # ---------------------------------------------------------------- instalacja
 
-def _download_release(name: str, arch: str) -> tuple[str, bytes]:
-    """Pobiera najnowszą statyczną binarkę z GitHub Releases. Zwraca (wersja, bajty)."""
+def _release_latest(name: str, arch: str) -> tuple[str, str]:
+    """Najnowsze wydanie z GitHub Releases. Zwraca (wersja, URL_tar.gz).
+
+    To tylko małe zapytanie do API – sam plik ~170 MB pobiera DOPiero cel
+    (curl/wget na hoście docelowym), więc panel nie przesyła go przez
+    pct push / QEMU Guest Agent / SFTP."""
     repo = {"trivy": "aquasecurity/trivy", "grype": "anchore/grype"}[name]
     r = httpx.get(f"{GITHUB_API}/repos/{repo}/releases/latest", timeout=40,
                   headers={"Accept": "application/vnd.github+json"})
     r.raise_for_status()
     data = r.json()
     version = (data.get("tag_name") or "").lstrip("v")
-    asset = None
     if name == "trivy":
         want = "Linux-64bit.tar.gz" if arch in ("amd64", "arm") else "Linux-ARM64.tar.gz"
-        for a in data.get("assets", []):
-            if a.get("name", "").startswith("trivy_") and a["name"].endswith(want):
-                asset = a
-                break
+
+        def _match(n: str) -> bool:
+            return n.startswith("trivy_") and n.endswith(want)
     else:
         want = f"linux_{arch}.tar.gz"
-        for a in data.get("assets", []):
-            if a.get("name", "").startswith("grype_") and f"_{want}" in a["name"]:
-                asset = a
-                break
-    if not asset:
-        names = ", ".join(a.get("name", "") for a in (data.get("assets") or [])[:25])
-        raise RuntimeError(f"Nie znaleziono paczki {name} dla architektury '{arch}'. "
-                           f"Dostępne: {names}")
-    tar_r = httpx.get(asset["browser_download_url"], timeout=300, follow_redirects=True)
-    tar_r.raise_for_status()
-    bio = io.BytesIO(tar_r.content)
-    with tarfile.open(fileobj=bio, mode="r:gz") as tf:
+
+        def _match(n: str) -> bool:
+            return n.startswith("grype_") and f"_{want}" in n
+    for a in data.get("assets", []):
+        if _match(a.get("name", "")):
+            return version, a["browser_download_url"]
+    names = ", ".join(a.get("name", "") for a in (data.get("assets") or [])[:25])
+    raise RuntimeError(f"Nie znaleziono paczki {name} dla architektury '{arch}'. "
+                       f"Dostępne: {names}")
+
+
+def _download_blob(url: str) -> bytes:
+    """Fallback: pobiera archiwum do pamięci na HOŚCIE panelu."""
+    r = httpx.get(url, timeout=300, follow_redirects=True)
+    r.raise_for_status()
+    return r.content
+
+
+def _extract_bin(name: str, blob: bytes) -> bytes:
+    """Wyciąga binarkę <name> z archiwum tar.gz (fallback, w pamięci)."""
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:gz") as tf:
         for member in tf.getmembers():
             if member.isfile() and member.name.split("/")[-1] == name:
                 fobj = tf.extractfile(member)
                 if fobj:
-                    return version, fobj.read()
-    raise RuntimeError(f"Archiwum {asset.get('name')} nie zawiera binarki '{name}'")
+                    return fobj.read()
+    raise RuntimeError(f"Archiwum nie zawiera binarki '{name}'")
+
+
+def _target_install_cmd(name: str, url: str) -> str:
+    """Polecenie `sh -c` instalujące skaner BEZPOŚREDNIO NA CELU.
+
+    Cel sam pobiera statyczną binarkę z GitHub Releases (curl, a gdy brak –
+    wget), rozpakowuje i instaluje do /usr/local/bin. Dzięki temu przez
+    pct exec / qm guest exec / ssh / docker exec nie przesyłamy setek MB
+    i nie ma problemu z plikami 0-bajtowymi po przerwanym pushu.
+    Wszystkie błędy (brak curl/wget, brak internetu, uszkodzone archiwum)
+    trafiają do stderr, który wraca w komunikacie zadania w GUI."""
+    u = shlex.quote(url)
+    return (
+        "set -e; "
+        f"d=$(mktemp -d /tmp/.dash-{name}.XXXXXX) || exit 95; "
+        "trap 'rm -rf \"$d\"' EXIT INT TERM; "
+        "if command -v curl >/dev/null 2>&1; then "
+        "curl -fsSL --connect-timeout 20 -o \"$d/a.tgz\" " + u + "; "
+        "elif command -v wget >/dev/null 2>&1; then "
+        "wget -qO \"$d/a.tgz\" " + u + "; "
+        "else echo 'NO_FETCHER: cel nie ma curl ani wget' >&2; exit 91; fi; "
+        "test -s \"$d/a.tgz\" || { echo 'DOWNLOAD_EMPTY: pobrano 0 bajtów' >&2; exit 92; }; "
+        "tar -xzf \"$d/a.tgz\" -C \"$d\"; "
+        f"b=$(find \"$d\" -type f -name {shlex.quote(name)} | head -n 1); "
+        "test -n \"$b\" || { echo 'NO_BIN: w archiwum nie ma binarki' >&2; exit 93; }; "
+        "mkdir -p /usr/local/bin; "
+        f"cp \"$b\" /usr/local/bin/{name}; "
+        f"chmod 0755 /usr/local/bin/{name}; "
+        f"test -s /usr/local/bin/{name} || {{ echo 'DST_EMPTY: plik po instalacji pusty' >&2; exit 94; }}; "
+        f"/usr/local/bin/{name} --version"
+    )
 
 
 def _deploy_local(tmp_path: str, name: str) -> None:
@@ -174,10 +216,16 @@ def _deploy_local(tmp_path: str, name: str) -> None:
 
 
 def _deploy_pct(ep: dict, local_path: str, name: str) -> None:
-    """Wgrywa binarkę do kontenera LXC przez `pct push` (węzeł lokalny lub przez SSH)."""
+    """Wgrywa binarkę do kontenera LXC przez `pct push` (węzeł lokalny lub przez SSH).
+
+    Uwaga na współbieżność: ścieżka tymczasowa jest UNIKALNA dla każdego
+    zadania (dawniej PID procesu – równoległe instalacje nadpisywały sobie
+    plik, co dawało binarki 0-bajtowe w kontenerze)."""
     import ssh_manager
     vmid = ep["vmid"]
-    node_tmp = f"/tmp/.dash-{name}-{os.getpid()}"
+    if not os.path.isfile(local_path) or os.path.getsize(local_path) == 0:
+        raise CommandError(1, "", "", f"Plik źródłowy {local_path} jest pusty – nie wysyłam")
+    node_tmp = f"/tmp/.dash-{name}-{uuid.uuid4().hex[:8]}"
     if ep.get("via") == "ssh":
         host = store.get_ssh_host(ep["ssh_host_id"])
         ssh_manager.upload_file(host, local_path, node_tmp)
@@ -187,22 +235,33 @@ def _deploy_pct(ep: dict, local_path: str, name: str) -> None:
     if ep.get("via") == "ssh":
         rc, out, err = ssh_manager.run(
             store.get_ssh_host(ep["ssh_host_id"]),
-            f"pct push {vmid} {shlex.quote(node_tmp)} /usr/local/bin/{name} --perms 0755", 90)
+            f"pct push {vmid} {shlex.quote(node_tmp)} /usr/local/bin/{name} --perms 0755", 180)
         ssh_manager.run(store.get_ssh_host(ep["ssh_host_id"]),
                         f"rm -f {shlex.quote(node_tmp)}", 15)
     else:
         rc, out, err = executor.run_local(
-            ["pct", "push", str(vmid), node_tmp, f"/usr/local/bin/{name}", "--perms", "0755"], 90)
+            ["pct", "push", str(vmid), node_tmp, f"/usr/local/bin/{name}", "--perms", "0755"], 180)
         executor.run_local(["sh", "-c", f"rm -f {shlex.quote(node_tmp)}"], 15)
     if rc != 0:
         raise CommandError(rc, out, err, "pct push nie powiódł się")
-    # Niektóre wersje PVE ignorują --perms – wymuś prawa wykonywania i sprawdź obecność.
+    # Niektóre wersje PVE ignorują --perms – wymuś prawa wykonywania i sprawdź,
+    # że plik istnieje ORAZ nie jest pusty (push mógł po cichu przegrać 0 bajtów).
     executor.execute_checked(ep, f"chmod 0755 /usr/local/bin/{name} && "
-                                 f"test -x /usr/local/bin/{name}", 30)
+                                 f"test -x /usr/local/bin/{name} && "
+                                 f"test -s /usr/local/bin/{name}", 30)
 
 
 def install_scanner(target: dict, name: str, progress=None) -> str:
-    """Instaluje trivy/grype dla celu. Zwraca zainstalowaną wersję."""
+    """Instaluje (lub aktualizuje) trivy/grype dla celu. Zwraca wersję.
+
+    Strategia (od v1.2.0):
+      1. PREFEROWANA – cel pobiera binarkę SAM przez curl/wget (polecenie idzie
+         przez executor: pct exec / qm guest exec / ssh / docker exec).
+         Zero przesyłania setek MB przez panel; aktualizuje też starsze wersje.
+      2. FALLBACK – gdy cel nie ma curl/wget ani internetu (a da się wgrywać
+         pliki: local / ssh / pct / docker), panel pobiera binarkę na hoście
+         i wysyła (SFTP / pct push / docker cp).
+    """
     if name not in ("trivy", "grype"):
         raise ValueError(f"Nieznany skaner: {name}")
 
@@ -212,54 +271,86 @@ def install_scanner(target: dict, name: str, progress=None) -> str:
             progress(msg)
 
     ep, _rootfs = _scanner_exec_endpoint(target)
-    existing = check_scanner(ep, name)
-    if existing:
-        say(f"{name} już jest zainstalowany (v{existing})")
-        return existing
+    kind = ep.get("kind")
+    if kind == "api-lxc":
+        raise CommandError(1, "", "Instalacja w LXC przez samo API PVE nie jest możliwa – "
+                                  "dodaj węzeł przez SSH (zakładka: Dodaj hosta SSH).")
+    if kind == "docker-image":
+        raise CommandError(1, "", "Obraz Dockera nie ma powłoki – skanowanie obrazu odbywa "
+                                  "się na hoście panelu (zainstaluj skaner na hoście).")
 
     arch = executor.run_arch(ep)
-    say(f"Pobieram {name} dla architektury {arch} (GitHub Releases)…")
-    version, blob = _download_release(name, arch)
-    say(f"Pobrano {name} {version} ({max(1, len(blob) // 1048576)} MB). Wysyłam na cel…")
+    existing = check_scanner(ep, name)
+    say(f"Sprawdzam najnowszą wersję {name} ({arch}) na GitHubie…")
+    try:
+        version, url = _release_latest(name, arch)
+    except Exception as exc:
+        if existing:
+            say(f"Nie udało się sprawdzić nowszej wersji ({str(exc)[:140]}). "
+                f"Na celu zostaje {name} v{existing}")
+            return existing
+        raise
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=f"-{name}")
-    tmp.write(blob)
-    tmp.close()
+    if existing == version:
+        say(f"{name} v{existing} już zainstalowany (to najnowsza wersja)")
+        return existing
+    if existing:
+        say(f"Na celu jest {name} v{existing} – aktualizuję do v{version}…")
 
-    kind = ep.get("kind")
+    # ---------- 1) instalacja NA CELU (preferowana) ----------
+    say(f"Instaluję {name} {version} na celu (pobieranie curl/wget bezpośrednio "
+        f"na hoście docelowym)…")
+    try:
+        executor.execute_checked(ep, _target_install_cmd(name, url), timeout=INSTALL_TIMEOUT)
+        ver = check_scanner(ep, name)
+        if ver:
+            say(f"Zainstalowano {name} v{ver}")
+            return ver
+        # binarka wgrana, ale nie działa – lecimy do diagnostyki / fallbacku
+        raise CommandError(1, "", "", "binarka wgrana na celu, ale `--version` nie odpowiada")
+    except CommandError as exc:
+        reason = ((exc.err or "") + " " + (exc.out or "")).strip()[-260:] or str(exc)
+        if kind not in ("local", "ssh", "pct", "docker-exec"):
+            # VM przez QEMU Guest Agent: nie da się wgrać pliku z zewnątrz.
+            raise CommandError(
+                exc.rc, exc.out, exc.err,
+                f"Instalacja {name} w VM nie powiodła się: {reason} "
+                f"| VM wymaga curl lub wget oraz dostępu do internetu; "
+                f"alternatywnie dodaj tę maszynę jako host SSH (instalacja przez SFTP).") from None
+        say(f"Pobieranie na celu nie powiodło się ({reason[:160]}) – "
+            f"pobieram na hoście panelu i wysyłam na cel…")
+
+    # ---------- 2) fallback: pobierz na hoście panelu i wgraj na cel ----------
+    blob = _download_blob(url)
+    bin_bytes = _extract_bin(name, blob)
+    say(f"Pobrano {name} {version} ({max(1, len(bin_bytes) // 1048576)} MB). Wysyłam na cel…")
+    fd, tmp = tempfile.mkstemp(prefix=f".dash-{name}-", suffix=".bin")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(bin_bytes)
+    os.chmod(tmp, 0o755)
     try:
         if kind == "local":
-            _deploy_local(tmp.name, name)
-        elif kind == "api-lxc":
-            raise CommandError(1, "", "Instalacja w LXC przez samo API PVE nie jest możliwa – "
-                                      "dodaj węzeł przez SSH (zakładka: Dodaj hosta SSH).")
+            _deploy_local(tmp, name)
         elif kind == "ssh":
             import ssh_manager
-            remote_tmp = f"/tmp/.dash-{name}-{os.getpid()}"
-            ssh_manager.upload_file(store.get_ssh_host(ep["ssh_host_id"]), tmp.name, remote_tmp)
+            remote_tmp = f"/tmp/.dash-{name}-{uuid.uuid4().hex[:8]}"
+            ssh_manager.upload_file(store.get_ssh_host(ep["ssh_host_id"]), tmp, remote_tmp)
             executor.execute_checked(
                 ep, f"install -m 0755 {shlex.quote(remote_tmp)} /usr/local/bin/{name} "
                     f"|| sudo -n install -m 0755 {shlex.quote(remote_tmp)} /usr/local/bin/{name}", 90)
             executor.execute_checked(ep, f"rm -f {shlex.quote(remote_tmp)}", 15)
         elif kind == "pct":
-            _deploy_pct(ep, tmp.name, name)
-        elif kind in ("qm", "api-qm"):
-            # Do VM nie wgramo pliku przez QGA – użyj oficjalnego skryptu wewnątrz VM
-            # (wymagany curl/wget oraz dostęp do internetu w VM).
-            say("Instaluję wewnątrz VM (skrypt oficjalny; wymagany curl/wget)…")
-            script = INSTALL_SCRIPTS[name]
-            cmd = (f"(curl -sfL {script} | sh -s -- -b /usr/local/bin) || "
-                   f"(wget -qO- {script} | sh -s -- -b /usr/local/bin)")
-            executor.execute_checked(ep, cmd, timeout=INSTALL_TIMEOUT)
+            _deploy_pct(ep, tmp, name)
         elif kind == "docker-exec":
             cid = ep["cid"]
             executor.execute_checked(ep, "mkdir -p /usr/local/bin", 20)
-            rc, out, err = executor.run_local(["docker", "cp", tmp.name,
+            rc, out, err = executor.run_local(["docker", "cp", tmp,
                                                f"{cid}:/usr/local/bin/{name}"], 90)
             if rc != 0:
                 raise CommandError(rc, out, err, "docker cp nie powiódł się "
                                                  "(kontener z READ-ONLY FS?)")
-            executor.execute_checked(ep, f"chmod 0755 /usr/local/bin/{name}", 20)
+            executor.execute_checked(ep, f"chmod 0755 /usr/local/bin/{name} && "
+                                         f"test -s /usr/local/bin/{name}", 20)
         else:
             raise CommandError(1, "", f"Instalacja skanera nieobsługiwana dla endpointu {kind}")
         ver = check_scanner(ep, name)
@@ -269,7 +360,7 @@ def install_scanner(target: dict, name: str, progress=None) -> str:
         return ver
     finally:
         try:
-            os.unlink(tmp.name)
+            os.unlink(tmp)
         except OSError:
             pass
 
@@ -294,8 +385,13 @@ def _install_verify_diag(endpoint: dict, name: str) -> str:
         if txt:
             parts.append(f"[{d}] {txt[:220]}")
     diag = " | ".join(parts)[:600]
-    hint = (" (kontener Alpine/musl? użyj skanowania rootfs z węzła albo "
-            "`apk add trivy`)" if "not found" in diag else "")
+    if re.search(r"\s0 [A-Z][a-z]{2} \d", diag) or "DOWNLOAD_EMPTY" in diag:
+        hint = " (plik na celu ma 0 bajtów – przerwane przesyłanie; spróbuj ponownie)"
+    elif "not found" in diag:
+        hint = (" (kontener Alpine/musl? użyj skanowania rootfs z węzła albo "
+                "`apk add trivy`)")
+    else:
+        hint = ""
     return (f"{name} wgrany, ale `--version` nie odpowiada{hint}. "
             f"Diagnostyka: {diag or 'brak wyjścia'}")
 

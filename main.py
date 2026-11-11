@@ -36,7 +36,7 @@ import ssh_manager         # noqa: E402
 import store               # noqa: E402
 from pydantic import BaseModel  # noqa: E402
 
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 
 TASKS: dict[str, dict] = {}
 _tasks_lock = threading.RLock()
